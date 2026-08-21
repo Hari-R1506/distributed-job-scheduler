@@ -8,9 +8,11 @@ automatically. Nothing is lost — the worst failure mode is *late*.
 
 ### Submission document
 
-**[Hari-R_127156127_Distributed-Job-Scheduler.docx](Hari-R_127156127_Distributed-Job-Scheduler.docx)** —
-the complete technical design document (27 pages), covering every assignment
+The complete technical design document — 27 pages, covering every assignment
 deliverable with rendered architecture and ER diagrams.
+
+- **[PDF](Hari-R_127156127_Distributed-Job-Scheduler.pdf)** — opens anywhere, no Word needed
+- **[Word](Hari-R_127156127_Distributed-Job-Scheduler.docx)** — same content, editable
 
 ### Documentation
 

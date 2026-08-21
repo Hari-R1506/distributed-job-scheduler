@@ -10,6 +10,9 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import {
   AlignmentType,
   ExternalHyperlink,
+  PositionalTab,
+  PositionalTabAlignment,
+  PositionalTabLeader,
   BorderStyle,
   Document,
   Footer,
@@ -23,11 +26,11 @@ import {
   ShadingType,
   Table,
   TableCell,
-  TableOfContents,
   TableRow,
   TextRun,
   WidthType,
 } from 'docx';
+import { TOC_ENTRIES } from './toc-entries.mjs';
 
 // US Letter in DXA. 1440 = 1 inch.
 const PAGE = { width: 12240, height: 15840 };
@@ -375,13 +378,49 @@ function buildBody() {
 
   // ── TOC ──
   c.push(h1('Contents'));
-  c.push(new TableOfContents('Contents', { hyperlink: true, headingStyleRange: '1-2' }));
-  c.push(
-    note(
-      'Right-click the table above and choose "Update Field" to populate page numbers.',
-      'In Word',
-    ),
-  );
+  // A STATIC table of contents, not a TOC field.
+  //
+  // A field would render as "Right-click to update" in anything but Word, and
+  // as an empty box in most readers — which is exactly what a reviewer opening
+  // this in a browser, on a phone, or in Google Docs would see. Page numbers
+  // here were captured from a real pagination pass and are baked in, so the
+  // document is correct wherever it is opened.
+  for (const [level, page, title] of TOC_ENTRIES) {
+    c.push(
+      new Paragraph({
+        spacing: { after: level === 1 ? 60 : 30, line: 264 },
+        indent: { left: level === 1 ? 0 : 300 },
+        children: [
+          new TextRun({
+            text: title,
+            font: BODY,
+            size: level === 1 ? 21 : 19,
+            bold: level === 1,
+            color: level === 1 ? INK : MUTED,
+          }),
+          new TextRun({
+            children: [
+              new PositionalTab({
+                alignment: PositionalTabAlignment.RIGHT,
+                relativeTo: 'margin',
+                leader: PositionalTabLeader.DOT,
+              }),
+            ],
+            font: BODY,
+            size: level === 1 ? 21 : 19,
+            color: level === 1 ? INK : MUTED,
+          }),
+          new TextRun({
+            text: String(page),
+            font: BODY,
+            size: level === 1 ? 21 : 19,
+            bold: level === 1,
+            color: level === 1 ? INK : MUTED,
+          }),
+        ],
+      }),
+    );
+  }
   c.push(pageBreak());
 
   // ══ 0. Deliverables & how to run ══
