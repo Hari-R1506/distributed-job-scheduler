@@ -9,6 +9,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import {
   AlignmentType,
+  ExternalHyperlink,
   BorderStyle,
   Document,
   Footer,
@@ -41,6 +42,31 @@ const HEAD_BG = 'EFF2F6';
 
 const MONO = 'Consolas';
 const BODY = 'Calibri';
+
+const REPO = 'https://github.com/Hari-R1506/distributed-job-scheduler';
+const BLOB = `${REPO}/blob/main`;
+
+/** A clickable link paragraph. */
+const link = (text, href, o = {}) =>
+  new Paragraph({
+    spacing: { after: o.after ?? 140, line: 276 },
+    alignment: o.align,
+    children: [
+      new ExternalHyperlink({
+        link: href,
+        children: [
+          new TextRun({
+            text,
+            font: BODY,
+            size: o.size ?? 21,
+            color: '1155CC',
+            bold: o.bold,
+            underline: {},
+          }),
+        ],
+      }),
+    ],
+  });
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -333,9 +359,11 @@ function buildBody() {
     table(
       ['', ''],
       [
-        ['Submitted for', 'Codity.AI — Intern Technical Assignment'],
-        ['Author', '________________________'],
+        ['Candidate', 'Hari R'],
+        ['Registration no.', '127156127'],
+        ['Submitted to', 'Codity.AI — Intern Technical Assignment'],
         ['Date', new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })],
+        ['Repository', REPO],
         ['Stack', 'TypeScript · NestJS · PostgreSQL 16 · React · Docker'],
         ['Scale', '16 tables · 56 API operations · 7 containers · 85 unit tests'],
       ],
@@ -354,6 +382,75 @@ function buildBody() {
       'In Word',
     ),
   );
+  c.push(pageBreak());
+
+  // ══ 0. Deliverables & how to run ══
+  c.push(h1('Deliverables'));
+  c.push(
+    p(
+      'Every item required by the assignment, and where it is. All links point into the public repository.',
+    ),
+  );
+  c.push(
+    table(
+      ['#', 'Required', 'Where it lives'],
+      [
+        ['1', 'Source code with setup instructions', 'The repository · README.md · docs/SETUP.md'],
+        ['2', 'Architecture diagram', 'Section 2 of this document · docs/ARCHITECTURE.md (6 diagrams)'],
+        ['3', 'ER diagram', 'Section 3 of this document · docs/DATABASE.md (16 tables)'],
+        ['4', 'API documentation', 'Section 10 · docs/API.md · live Swagger at /docs · docs/api/openapi.json'],
+        ['5', 'Design decisions document', 'Section 9 of this document · docs/DESIGN-DECISIONS.md'],
+        ['6', 'Automated tests', 'Section 11 · tests/ — unit, integration and concurrency suites'],
+      ],
+      [0.3, 1.9, 3.4],
+    ),
+  );
+  c.push(spacer(200));
+  c.push(rich([['Repository: ', { bold: true }]], { after: 40 }));
+  c.push(link(REPO, REPO, { bold: true, after: 220 }));
+
+  c.push(h2('Evaluating it in five minutes'));
+  c.push(
+    ...code([
+      'git clone https://github.com/Hari-R1506/distributed-job-scheduler.git',
+      'cd distributed-job-scheduler',
+      'cp .env.example .env',
+      'npm install && npm run db:generate',
+      'docker compose up -d --build',
+    ]),
+  );
+  c.push(
+    rich([
+      ['Register an account at ', {}],
+      ['http://localhost:5173', { code: true }],
+      [', then run ', {}],
+      ['npm run seed', { code: true }],
+      ['. Seven containers start: PostgreSQL, the API, a leader-elected scheduler, three independent workers, and the dashboard.', {}],
+    ]),
+  );
+
+  c.push(h3('The demonstration'));
+  c.push(p('Open the Workers page in the dashboard, then:'));
+  c.push(...code(['docker kill djs-worker-2']));
+  c.push(
+    p(
+      'SIGKILL — instant termination, no drain, no lease release. Equivalent to a server losing power mid-job.',
+    ),
+  );
+  c.push(
+    ...bullets([
+      [['At roughly 30 seconds', { bold: true }], [' the scheduler marks the worker DEAD after six missed heartbeats.', {}]],
+      [['At roughly 60 seconds', { bold: true }], [' the reaper finds its expired leases, closes those attempts as ABANDONED, and requeues the jobs.', {}]],
+      [['Immediately after', { bold: true }], [' the surviving workers claim and complete them.', {}]],
+    ]),
+  );
+  c.push(
+    rich([
+      ['Nothing is lost, and nobody intervenes. ', { bold: true }],
+      ['Contrast with docker stop, which sends SIGTERM: the worker drains its in-flight jobs and exits cleanly in about three seconds, with no job retried.', {}],
+    ]),
+  );
+
   c.push(pageBreak());
 
   // ══ 1. Executive summary ══
@@ -1385,7 +1482,7 @@ function buildBody() {
   return c;
 }
 
-const out = 'docs/Distributed-Job-Scheduler-Technical-Design.docx';
+const out = 'Hari-R_127156127_Distributed-Job-Scheduler.docx';
 const buf = await Packer.toBuffer(doc);
 writeFileSync(out, buf);
 console.log(`wrote ${out} (${(buf.length / 1024).toFixed(0)} KB)`);

@@ -6,6 +6,12 @@ Multiple workers claim from the same queue simultaneously and **never** run the
 same job twice. Any worker can be killed at any moment and its work is recovered
 automatically. Nothing is lost — the worst failure mode is *late*.
 
+### Submission document
+
+**[Hari-R_127156127_Distributed-Job-Scheduler.docx](Hari-R_127156127_Distributed-Job-Scheduler.docx)** —
+the complete technical design document (27 pages), covering every assignment
+deliverable with rendered architecture and ER diagrams.
+
 ### Documentation
 
 | | |
