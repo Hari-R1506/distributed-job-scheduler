@@ -1,0 +1,30 @@
+flowchart TB
+    subgraph Client
+        UI[React SPA<br/>Vite · TanStack Query]
+    end
+    subgraph API["API Service (NestJS)"]
+        direction LR
+        G[Guards: Auth · Tenancy · RBAC] --> M[Feature modules:<br/>auth · projects · queues · jobs<br/>schedules · dlq · metrics]
+        M --> R[(Repositories)]
+    end
+    subgraph DATA["PostgreSQL 16"]
+        DB[(system of record<br/>+ the queue<br/>SKIP LOCKED · advisory locks<br/>LISTEN/NOTIFY)]
+    end
+    subgraph FLEET["Worker fleet (N processes)"]
+        W1[Worker 1<br/>claim · execute · heartbeat]
+        W2[Worker 2]
+        W3[Worker 3]
+    end
+    SCH["Scheduler (leader-elected)<br/>promote · cron · reap · rollup"]
+
+    UI -->|REST /api/v1| API
+    UI <-->|WebSocket| API
+    API --> DB
+    W1 <--> DB
+    W2 <--> DB
+    W3 <--> DB
+    SCH <--> DB
+    DB -.->|NOTIFY jobs_ready| W1
+    DB -.->|NOTIFY jobs_ready| W2
+    DB -.->|NOTIFY jobs_ready| W3
+    API -.->|/metrics| PROM[Prometheus<br/>optional]

@@ -1,0 +1,37 @@
+erDiagram
+    ORGANIZATIONS  ||--o{ MEMBERSHIPS : has
+    USERS          ||--o{ MEMBERSHIPS : in
+    ORGANIZATIONS  ||--o{ PROJECTS : owns
+    ORGANIZATIONS  ||--o{ WORKERS : registers
+    PROJECTS       ||--o{ QUEUES : contains
+    PROJECTS       ||--o{ RETRY_POLICIES : defines
+    PROJECTS       ||--o{ API_KEYS : issues
+    PROJECTS       ||--o{ SCHEDULED_JOBS : defines
+    RETRY_POLICIES ||--o{ QUEUES : "configures (RESTRICT)"
+    QUEUES         ||--o{ JOBS : holds
+    QUEUES         ||--o{ QUEUE_METRICS_MINUTE : "rolled up into"
+    SCHEDULED_JOBS ||--o{ JOBS : materialises
+    JOBS           ||--o{ JOB_EXECUTIONS : "one per attempt"
+    JOBS           ||--o| DEAD_LETTER_JOBS : "at most one"
+    JOBS           ||--o{ JOBS : "parent_job_id (replay chain)"
+    JOB_EXECUTIONS ||--o{ JOB_LOGS : emits
+    WORKERS        ||--o{ WORKER_HEARTBEATS : samples
+    WORKERS        ||--o{ WORKER_SUBSCRIPTIONS : "serves"
+    QUEUES         ||--o{ WORKER_SUBSCRIPTIONS : "served by"
+    WORKERS        ||--o{ JOB_EXECUTIONS : "ran (SET NULL)"
+
+    ORGANIZATIONS { uuid id PK  text slug UK }
+    USERS         { uuid id PK  citext email UK  text password_hash }
+    MEMBERSHIPS   { uuid id PK  uuid org_id FK  uuid user_id FK  member_role role }
+    PROJECTS      { uuid id PK  uuid org_id FK  citext slug  timestamptz archived_at }
+    RETRY_POLICIES{ uuid id PK  uuid project_id FK  backoff_strategy strategy  int max_attempts  int base_delay_ms  int max_delay_ms }
+    QUEUES        { uuid id PK  uuid project_id FK  text name  int max_concurrency  bool is_paused  int visibility_timeout_ms  uuid retry_policy_id FK }
+    JOBS          { uuid id PK  uuid queue_id FK  uuid project_id FK  text handler  jsonb payload  smallint priority  job_status status  timestamptz run_at  int attempt_count  int max_attempts  uuid worker_id FK  timestamptz lease_expires_at  text idempotency_key }
+    JOB_EXECUTIONS{ bigint id PK  uuid job_id FK  int attempt  uuid worker_id FK  execution_status status  int duration_ms  text error_code }
+    JOB_LOGS      { bigint id PK  bigint execution_id FK  uuid job_id  log_level level  text message }
+    WORKERS       { uuid id PK  uuid org_id FK  text name  worker_status status  int concurrency  timestamptz last_heartbeat_at }
+    WORKER_SUBSCRIPTIONS { uuid worker_id FK  uuid queue_id FK }
+    WORKER_HEARTBEATS    { bigint id PK  uuid worker_id FK  timestamptz recorded_at  int active_job_count }
+    SCHEDULED_JOBS{ uuid id PK  uuid project_id FK  uuid queue_id FK  text cron_expression  text timezone  timestamptz next_run_at  misfire_policy misfire_policy }
+    DEAD_LETTER_JOBS { uuid id PK  uuid job_id FK,UK  dlq_reason reason  jsonb payload_snapshot  timestamptz resolved_at  uuid replay_job_id FK }
+    QUEUE_METRICS_MINUTE { bigint id PK  uuid queue_id FK  timestamptz bucket  int completed_count  int p95_duration_ms }

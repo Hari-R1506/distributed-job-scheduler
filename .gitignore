@@ -1,0 +1,29 @@
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+.env
+.env.local
+.env.*.local
+!.env.example
+
+coverage/
+.vitest/
+test-results/
+playwright-report/
+
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+packages/db/generated/
+pgdata/
+
+# The assignment brief itself — Codity.AI's document, not ours to redistribute.
+*Tech Assignment.docx

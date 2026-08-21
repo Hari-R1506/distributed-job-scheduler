@@ -1,0 +1,13 @@
+flowchart TD
+    A[Handler throws / times out] --> B[Classify error → error_code]
+    B --> C[Write job_executions row:<br/>FAILED / TIMED_OUT + error]
+    C --> D{Retryable error?}
+    D -- No --> G[DEAD_LETTER<br/>reason = NON_RETRYABLE_ERROR]
+    D -- Yes --> E{attempt_count < max_attempts?}
+    E -- No --> H[DEAD_LETTER<br/>reason = MAX_ATTEMPTS_EXCEEDED]
+    E -- Yes --> F["delay = strategy(attempt)<br/>capped, jittered"]
+    F --> I["job → RETRYING<br/>run_at = now() + delay<br/>clear worker_id, lease"]
+    I --> J[Scheduler promotes when due]
+    J --> K[QUEUED → claimed again]
+    G --> L[INSERT dead_letter_jobs]
+    H --> L

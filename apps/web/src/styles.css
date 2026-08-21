@@ -1,0 +1,104 @@
+@import 'tailwindcss';
+
+/*
+ * A single, deliberate dark theme.
+ *
+ * Ops dashboards are looked at for long stretches in dim rooms, and every tool
+ * in this category (Grafana, Datadog, Vercel) defaults dark for that reason.
+ * Committing to one theme done well beats two done half-way — so every colour
+ * below is defined explicitly rather than inherited from a light default.
+ *
+ * Semantic colours (ok / warn / bad) are separate from the accent, so status is
+ * never confused with branding.
+ */
+@theme {
+  --color-ink-950: #0a0c10;
+  --color-ink-900: #0f1218;
+  --color-ink-850: #141822;
+  --color-ink-800: #1a1f2b;
+  --color-ink-700: #252b3a;
+  --color-ink-600: #363d50;
+
+  --color-mist-500: #6b7488;
+  --color-mist-400: #8b94a8;
+  --color-mist-300: #aab2c4;
+  --color-mist-100: #e4e8f0;
+
+  /* Accent: a cool cyan. Used for interactive affordances only — never for
+     status, so "blue" always means "you can click this". */
+  --color-signal-500: #2dd4bf;
+  --color-signal-600: #14b8a6;
+  --color-signal-400: #5eead4;
+
+  --color-ok-500: #34d399;
+  --color-warn-500: #fbbf24;
+  --color-bad-500: #f87171;
+  --color-info-500: #60a5fa;
+  --color-idle-500: #818cf8;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-ink-950);
+  color: var(--color-mist-100);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Digits that line up in columns — counts, durations, timestamps. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+.mono {
+  font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-ink-900);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-ink-700);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-600);
+}
+
+/* Keyboard focus must stay visible; the default ring is invisible on dark. */
+:focus-visible {
+  outline: 2px solid var(--color-signal-500);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.live-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}

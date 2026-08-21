@@ -1,0 +1,15 @@
+sequenceDiagram
+    participant S as Scheduler (leader)
+    participant SJ as scheduled_jobs
+    participant J as jobs
+    S->>SJ: SELECT * WHERE is_enabled AND next_run_at <= now() LIMIT 100 FOR UPDATE SKIP LOCKED
+    loop for each due template
+        S->>S: fired_for = next_run_at<br/>next = cronParser.next(expr, tz, from=fired_for)
+        S->>S: apply misfire policy if next is still in the past
+        Note over S,J: ONE transaction:
+        S->>SJ: UPDATE next_run_at = next, last_run_at = now()<br/>WHERE id = $1 AND next_run_at = fired_for   ← optimistic CAS
+        S->>J: INSERT job (scheduled_job_id, scheduled_for = fired_for, run_at = now(), ...template)
+        Note over J: UNIQUE (scheduled_job_id, scheduled_for)<br/>ON CONFLICT DO NOTHING
+        S->>SJ: UPDATE last_job_id
+    end
+    S->>J: pg_notify('jobs_ready', queue_id)

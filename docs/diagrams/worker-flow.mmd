@@ -1,0 +1,26 @@
+flowchart TD
+    S([start]) --> CFG[load + validate config]
+    CFG --> REG[register in workers<br/>+ subscriptions]
+    REG --> SIG[install SIGTERM/SIGINT traps]
+    SIG --> LOOPS[start heartbeat · log flusher · LISTEN]
+    LOOPS --> POLL{free slots?}
+    POLL -- no --> WAITSLOT[await a slot freeing<br/>zero DB queries] --> POLL
+    POLL -- yes --> CLAIM["claim(queue, freeSlots)<br/>SHORT TXN"]
+    CLAIM --> GOT{got jobs?}
+    GOT -- no --> IDLE[await NOTIFY<br/>or jittered 0.5–2s] --> POLL
+    GOT -- yes --> DISP[dispatch to executor pool] --> POLL
+
+    DISP -.-> MR{markRunning<br/>conditional update}
+    MR -- 0 rows --> LOST[lease lost →<br/>drop, count metric]
+    MR -- ok --> RUN[run handler<br/>with timeout + AbortSignal]
+    RUN --> OK{outcome}
+    OK -- success --> DONE[TXN: execution SUCCEEDED<br/>+ job COMPLETED]
+    OK -- error --> FAIL[classify → retry or DLQ<br/>one TXN]
+    DONE --> FREE[release slot] --> POLL
+    FAIL --> FREE
+    LOST --> FREE
+
+    SIG -.SIGTERM.-> DRAIN[status DRAINING<br/>stop claiming<br/>KEEP heartbeating]
+    DRAIN --> AWAIT[await in-flight ≤30s]
+    AWAIT --> REL[release stragglers → RETRYING]
+    REL --> STOP[status STOPPED · flush logs · exit 0]

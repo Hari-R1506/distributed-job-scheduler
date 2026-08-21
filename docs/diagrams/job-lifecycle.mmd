@@ -1,0 +1,26 @@
+stateDiagram-v2
+    [*] --> SCHEDULED: create with future run_at
+    [*] --> QUEUED: create immediate
+
+    SCHEDULED --> QUEUED: scheduler promotes<br/>(run_at <= now)
+    QUEUED --> CLAIMED: worker claims<br/>(atomic, leased)
+    CLAIMED --> RUNNING: worker starts handler
+    RUNNING --> COMPLETED: handler resolves
+
+    RUNNING --> RETRYING: attempt failed,<br/>attempts remain
+    CLAIMED --> RETRYING: lease expired<br/>before start (reaper)
+    RUNNING --> RETRYING: lease expired<br/>mid-flight (reaper)
+    RETRYING --> QUEUED: scheduler promotes<br/>after backoff
+
+    RUNNING --> DEAD_LETTER: attempts exhausted<br/>or non-retryable
+    RUNNING --> FAILED: same, but queue<br/>has dlq_enabled=false
+
+    SCHEDULED --> CANCELLED: user cancels
+    QUEUED --> CANCELLED: user cancels
+    RETRYING --> CANCELLED: user cancels
+
+    DEAD_LETTER --> [*]: replay creates a NEW job<br/>(parent_job_id set)
+
+    COMPLETED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]

@@ -1,0 +1,17 @@
+{
+  "name": "@djs/worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@djs/core": "*",
+    "@djs/db": "*",
+    "pino": "^9.5.0"
+  }
+}

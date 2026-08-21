@@ -1,0 +1,182 @@
+# Runs the entire platform on one machine: API, scheduler, THREE independent
+# workers, the web dashboard, and Postgres.
+#
+# Three separate worker containers (rather than `--scale`) are deliberate: the
+# demo depends on being able to `docker kill djs-worker-2` and watch the reaper
+# recover its in-flight jobs. See ARCHITECTURE.md §30.5.
+
+x-node-base: &node-base
+  # One image, shared by api / scheduler / all workers. Without an explicit
+  # `image:` each service builds and stores its OWN copy of an identical image,
+  # which wastes minutes of build time and — worse — lets services drift onto
+  # different builds when you rebuild only some of them.
+  image: djs-node:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &node-env
+    NODE_ENV: ${NODE_ENV:-development}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    DATABASE_URL: postgresql://${POSTGRES_USER:-djs}:${POSTGRES_PASSWORD:-djs_dev_password}@postgres:5432/${POSTGRES_DB:-job_scheduler}?schema=public
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+  networks: [djs]
+
+x-worker-base: &worker-base
+  <<: *node-base
+  command: node apps/worker/dist/main.js
+  environment: &worker-env
+    <<: *node-env
+    WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+    WORKER_QUEUES: ${WORKER_QUEUES:-*}
+    WORKER_POLL_MIN_MS: ${WORKER_POLL_MIN_MS:-250}
+    WORKER_POLL_MAX_MS: ${WORKER_POLL_MAX_MS:-2000}
+    WORKER_HEARTBEAT_MS: ${WORKER_HEARTBEAT_MS:-5000}
+    WORKER_SHUTDOWN_GRACE_MS: ${WORKER_SHUTDOWN_GRACE_MS:-30000}
+    WORKER_HTTP_PORT: 3100
+  # Must exceed WORKER_SHUTDOWN_GRACE_MS or the drain is cut short by SIGKILL.
+  stop_grace_period: 40s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: djs-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-djs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-djs_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-job_scheduler}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-djs} -d ${POSTGRES_DB:-job_scheduler}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    # max_connections headroom: api(10) + 3 workers(13 each) + scheduler(3) = 52.
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - log_min_duration_statement=500
+    networks: [djs]
+
+  migrate:
+    <<: *node-base
+    container_name: djs-migrate
+    command: npx prisma migrate deploy --schema packages/db/prisma/schema.prisma
+    restart: "no"
+
+  api:
+    <<: *node-base
+    container_name: djs-api
+    command: node apps/api/dist/main.js
+    environment:
+      <<: *node-env
+      API_PORT: 3000
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET in .env}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET in .env}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-7d}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AI_SUMMARY_MODEL: ${AI_SUMMARY_MODEL:-claude-sonnet-5}
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  scheduler:
+    <<: *node-base
+    container_name: djs-scheduler
+    command: node apps/scheduler/dist/main.js
+    environment:
+      <<: *node-env
+      SCHEDULER_TICK_MS: ${SCHEDULER_TICK_MS:-1000}
+      SCHEDULER_PROMOTE_BATCH: ${SCHEDULER_PROMOTE_BATCH:-500}
+      SCHEDULER_REAP_BATCH: ${SCHEDULER_REAP_BATCH:-200}
+      WORKER_TIMEOUT_MS: ${WORKER_TIMEOUT_MS:-30000}
+      RETENTION_JOB_LOGS_DAYS: ${RETENTION_JOB_LOGS_DAYS:-7}
+      RETENTION_HEARTBEATS_HOURS: ${RETENTION_HEARTBEATS_HOURS:-24}
+      RETENTION_DEAD_WORKERS_DAYS: ${RETENTION_DEAD_WORKERS_DAYS:-7}
+      SCHEDULER_HTTP_PORT: 3200
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker-1:
+    <<: *worker-base
+    container_name: djs-worker-1
+    environment:
+      <<: *worker-env
+      WORKER_NAME: worker-1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker-2:
+    <<: *worker-base
+    container_name: djs-worker-2
+    environment:
+      <<: *worker-env
+      WORKER_NAME: worker-2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker-3:
+    <<: *worker-base
+    container_name: djs-worker-3
+    environment:
+      <<: *worker-env
+      WORKER_NAME: worker-3
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Empty on purpose: the SPA then calls /api/v1 on its own origin and
+        # nginx proxies to the api container. Same-origin keeps the refresh
+        # cookie same-site and avoids a CORS preflight on every request.
+        VITE_API_URL: ${VITE_API_URL:-}
+    container_name: djs-web
+    ports:
+      - "${WEB_PORT:-5173}:80"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    networks: [djs]
+
+volumes:
+  pgdata:
+
+networks:
+  djs:
+    driver: bridge

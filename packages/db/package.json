@@ -1,0 +1,30 @@
+{
+  "name": "@djs/db",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./sql": "./dist/sql.js"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "generate": "prisma generate",
+    "migrate": "prisma migrate deploy",
+    "migrate:dev": "prisma migrate dev",
+    "reset": "prisma migrate reset --force",
+    "studio": "prisma studio"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.1.0",
+    "@djs/core": "*"
+  },
+  "devDependencies": {
+    "prisma": "^6.1.0"
+  }
+}

@@ -1,0 +1,674 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Distributed Job Scheduler — data model
+//
+//  Design rationale for every table, index and cascade rule lives in
+//  docs/ARCHITECTURE.md §4. The short version of the two decisions that matter
+//  most:
+//
+//   1. `jobs` holds the logical unit of work; `job_executions` holds one row per
+//      ATTEMPT. Attempts fail, jobs die. That split is what makes retry history,
+//      per-attempt worker assignment and per-attempt errors queryable.
+//
+//   2. `idx_jobs_claim` is a PARTIAL index over QUEUED rows only, with the
+//      ORDER BY baked into its column order. It is the reason the claim path
+//      stays fast when the table reaches millions of rows. Prisma cannot express
+//      partial indexes, so it is created in the migration by hand — see
+//      prisma/migrations/*/migration.sql.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["relationJoins"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ────────────────────────────────────────────────────────────────────
+
+/// The job lifecycle. See ARCHITECTURE.md §6.1 for the transition diagram.
+/// FAILED is terminal-without-a-DLQ-record (queue has dlqEnabled = false);
+/// DEAD_LETTER is terminal-with-one.
+enum JobStatus {
+  SCHEDULED // future runAt, not yet eligible
+  QUEUED // eligible now, awaiting a worker
+  CLAIMED // leased by a worker, not yet started
+  RUNNING // handler executing
+  RETRYING // attempt failed, backoff timer running
+  COMPLETED
+  FAILED
+  DEAD_LETTER
+  CANCELLED
+
+  @@map("job_status")
+}
+
+enum ExecutionStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  TIMED_OUT
+  ABANDONED // the worker died mid-attempt; closed by the reaper
+  CANCELLED
+
+  @@map("execution_status")
+}
+
+enum BackoffStrategy {
+  FIXED
+  LINEAR
+  EXPONENTIAL
+
+  @@map("backoff_strategy")
+}
+
+enum WorkerStatus {
+  STARTING
+  ACTIVE
+  DRAINING // received SIGTERM, finishing in-flight work
+  STOPPED // exited cleanly
+  DEAD // stopped heartbeating
+
+  @@map("worker_status")
+}
+
+enum LogLevel {
+  DEBUG
+  INFO
+  WARN
+  ERROR
+
+  @@map("log_level")
+}
+
+enum MemberRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+
+  @@map("member_role")
+}
+
+enum DlqReason {
+  MAX_ATTEMPTS_EXCEEDED
+  NON_RETRYABLE_ERROR
+  TIMEOUT
+  LEASE_EXPIRED
+  CANCELLED_BY_SYSTEM
+
+  @@map("dlq_reason")
+}
+
+enum DlqResolution {
+  REPLAYED
+  DISCARDED
+
+  @@map("dlq_resolution")
+}
+
+/// What to do when the scheduler was down and cron slots were missed.
+/// SKIP (the default) fires once for the most recent missed slot and
+/// fast-forwards past the rest. See ARCHITECTURE.md §10.4.
+enum MisfirePolicy {
+  SKIP
+  FIRE_ONCE
+  BACKFILL
+
+  @@map("misfire_policy")
+}
+
+// ── Tenancy ──────────────────────────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  memberships Membership[]
+  projects    Project[]
+  workers     Worker[]
+
+  @@map("organizations")
+}
+
+/// Users are NOT owned by an organization — one user may belong to several.
+/// That many-to-many is what `Membership` exists for, and it is where RBAC lives.
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  name         String
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at") @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  memberships    Membership[]
+  createdProjects Project[]       @relation("ProjectCreatedBy")
+  createdJobs     Job[]           @relation("JobCreatedBy")
+  createdApiKeys  ApiKey[]        @relation("ApiKeyCreatedBy")
+  pausedQueues    Queue[]         @relation("QueuePausedBy")
+  createdSchedules ScheduledJob[] @relation("ScheduleCreatedBy")
+  resolvedDlq     DeadLetterJob[] @relation("DlqResolvedBy")
+
+  @@map("users")
+}
+
+model Membership {
+  id        String     @id @default(uuid()) @db.Uuid
+  orgId     String     @map("org_id") @db.Uuid
+  userId    String     @map("user_id") @db.Uuid
+  role      MemberRole @default(MEMBER)
+  createdAt DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId])
+  @@map("memberships")
+}
+
+model Project {
+  id          String    @id @default(uuid()) @db.Uuid
+  orgId       String    @map("org_id") @db.Uuid
+  name        String
+  slug        String
+  description String?
+  createdById String?   @map("created_by") @db.Uuid
+  archivedAt  DateTime? @map("archived_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  createdBy User?        @relation("ProjectCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  queues        Queue[]
+  retryPolicies RetryPolicy[]
+  apiKeys       ApiKey[]
+  jobs          Job[]
+  scheduledJobs ScheduledJob[]
+  deadLetterJobs DeadLetterJob[]
+
+  // Slugs are unique per tenant, not globally.
+  @@unique([orgId, slug])
+  @@map("projects")
+}
+
+/// Jobs are submitted by services, not browsers. A backend enqueuing work cannot
+/// hold a 15-minute JWT — hence hashed API keys. Plaintext is shown once, at
+/// creation, and never stored.
+model ApiKey {
+  id          String    @id @default(uuid()) @db.Uuid
+  projectId   String    @map("project_id") @db.Uuid
+  name        String
+  keyPrefix   String    @map("key_prefix")
+  keyHash     String    @unique @map("key_hash")
+  scopes      String[]  @default(["jobs:read", "jobs:write"])
+  lastUsedAt  DateTime? @map("last_used_at") @db.Timestamptz(3)
+  expiresAt   DateTime? @map("expires_at") @db.Timestamptz(3)
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdById String?   @map("created_by") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy User?   @relation("ApiKeyCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([projectId])
+  @@map("api_keys")
+}
+
+// ── Queue configuration ──────────────────────────────────────────────────────
+
+/// A reusable, named backoff contract. Several queues may share one.
+/// NOTE: the *values* are snapshotted onto each Job at creation — editing a
+/// policy must not retroactively rewrite the contract of in-flight jobs.
+/// See ARCHITECTURE.md §29.7.
+model RetryPolicy {
+  id                String          @id @default(uuid()) @db.Uuid
+  projectId         String          @map("project_id") @db.Uuid
+  name              String
+  strategy          BackoffStrategy
+  maxAttempts       Int             @map("max_attempts")
+  baseDelayMs       Int             @map("base_delay_ms")
+  maxDelayMs        Int             @map("max_delay_ms")
+  jitterPct         Int             @default(10) @map("jitter_pct") @db.SmallInt
+  /// Empty = retry every error the classifier considers retryable. A non-empty
+  /// list narrows retries to exactly these error codes.
+  retryOnErrorCodes String[]        @default([]) @map("retry_on_error_codes")
+  isDefault         Boolean         @default(false) @map("is_default")
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  queues  Queue[]
+  jobs    Job[]
+  scheduledJobs ScheduledJob[]
+
+  @@unique([projectId, name])
+  @@map("retry_policies")
+}
+
+/// NOTE the deliberate absence of counter columns (total_jobs, completed_count).
+/// Incrementing one on every completion would take a row lock on a single row
+/// per queue — a global mutex by accident. Live counts come from indexed
+/// COUNT(*); history comes from queue_metrics_minute. See ARCHITECTURE.md §4.2.
+model Queue {
+  id                  String    @id @default(uuid()) @db.Uuid
+  projectId           String    @map("project_id") @db.Uuid
+  name                String
+  description         String?
+  defaultPriority     Int       @default(100) @map("default_priority") @db.SmallInt
+  /// null = unlimited. Enforced inside the claim transaction, not in the worker.
+  maxConcurrency      Int?      @map("max_concurrency")
+  retryPolicyId       String    @map("retry_policy_id") @db.Uuid
+  /// How long a claim stays valid before the reaper may take the job back.
+  /// INVARIANT: must exceed WORKER_TIMEOUT_MS. Validated at boot (§14.1).
+  visibilityTimeoutMs Int       @default(60000) @map("visibility_timeout_ms")
+  defaultJobTimeoutMs Int       @default(30000) @map("default_job_timeout_ms")
+  /// Reserved for the rate-limiting bonus.
+  rateLimitPerSec     Int?      @map("rate_limit_per_sec")
+  isPaused            Boolean   @default(false) @map("is_paused")
+  pausedAt            DateTime? @map("paused_at") @db.Timestamptz(3)
+  pausedById          String?   @map("paused_by") @db.Uuid
+  pauseReason         String?   @map("pause_reason")
+  dlqEnabled          Boolean   @default(true) @map("dlq_enabled")
+  retentionDays       Int?      @map("retention_days")
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  project  Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  // Restrict, not Cascade: deleting a policy that queues depend on must fail
+  // loudly rather than silently leaving queues undefined.
+  retryPolicy RetryPolicy @relation(fields: [retryPolicyId], references: [id], onDelete: Restrict)
+  pausedBy User?       @relation("QueuePausedBy", fields: [pausedById], references: [id], onDelete: SetNull)
+
+  jobs          Job[]
+  scheduledJobs ScheduledJob[]
+  subscriptions WorkerSubscription[]
+  metrics       QueueMetricMinute[]
+  deadLetterJobs DeadLetterJob[]
+
+  @@unique([projectId, name])
+  @@map("queues")
+}
+
+// ── The central table ────────────────────────────────────────────────────────
+
+model Job {
+  id String @id @default(uuid()) @db.Uuid
+
+  queueId String @map("queue_id") @db.Uuid
+  /// Denormalised from queue.projectId. Every tenant-scoped list query filters
+  /// on it, so carrying it lets the explorer index lead with project_id and
+  /// avoids a join on the hottest read path. Immutable — no update anomaly.
+  projectId String @map("project_id") @db.Uuid
+
+  scheduledJobId String? @map("scheduled_job_id") @db.Uuid
+  /// Set when this job was created by replaying a DLQ entry, or by a manual
+  /// retry. Gives a replay chain for free.
+  parentJobId    String? @map("parent_job_id") @db.Uuid
+  /// Groups jobs submitted through POST /jobs/batch.
+  batchId        String? @map("batch_id") @db.Uuid
+
+  /// Names a function in the worker's handler registry. Deliberately `text`
+  /// rather than an enum: the handler set is a property of the worker
+  /// deployment, so adding one must not require a migration.
+  handler        String
+  payload        Json     @default("{}")
+  metadata       Json?
+  /// Opt-in de-duplication. Unique per queue, enforced by a partial index.
+  /// Opt-in rather than inferred from a payload hash — two identical jobs
+  /// submitted on purpose must both run. See ARCHITECTURE.md §21 case 12.
+  idempotencyKey String?  @map("idempotency_key")
+
+  priority Int       @default(100) @db.SmallInt
+  status   JobStatus @default(QUEUED)
+
+  /// THE scheduling field. Immediate -> now(); delayed -> now()+delay;
+  /// scheduled -> the given instant; retrying -> now()+backoff. One column, one
+  /// index, four job types. Used as a FILTER for eligibility, never as a sort
+  /// key ahead of priority (§9.2).
+  runAt DateTime @default(now()) @map("run_at") @db.Timestamptz(3)
+  /// For cron-materialised jobs: the intended slot, which may differ from runAt
+  /// if the scheduler lagged. Half of the exactly-once unique index.
+  scheduledFor DateTime? @map("scheduled_for") @db.Timestamptz(3)
+
+  /// Incremented AT CLAIM, not at completion. A job that crashes its worker
+  /// before recording anything would otherwise be reclaimed forever — a poison
+  /// pill that kills the fleet one process at a time. See ARCHITECTURE.md §29.10.
+  attemptCount Int @default(0) @map("attempt_count")
+
+  // ── Retry contract, snapshotted at creation (§29.7) ──
+  maxAttempts      Int             @map("max_attempts")
+  backoffStrategy  BackoffStrategy @map("backoff_strategy")
+  backoffBaseMs    Int             @map("backoff_base_ms")
+  backoffMaxMs     Int             @map("backoff_max_ms")
+  backoffJitterPct Int             @default(10) @map("backoff_jitter_pct") @db.SmallInt
+  /// Kept as provenance only — never read at runtime.
+  retryPolicyId    String?         @map("retry_policy_id") @db.Uuid
+
+  timeoutMs Int @default(30000) @map("timeout_ms")
+
+  workerId        String?   @map("worker_id") @db.Uuid
+  /// When the claim stops being valid. NOT when the job times out.
+  leaseExpiresAt  DateTime? @map("lease_expires_at") @db.Timestamptz(3)
+  claimedAt       DateTime? @map("claimed_at") @db.Timestamptz(3)
+  startedAt       DateTime? @map("started_at") @db.Timestamptz(3)
+  finishedAt      DateTime? @map("finished_at") @db.Timestamptz(3)
+  /// Cooperative cancellation for RUNNING jobs — the handler checks between
+  /// await points.
+  cancelRequested Boolean   @default(false) @map("cancel_requested")
+
+  /// Denormalised from the newest execution so the job list can show a failure
+  /// reason without an N+1 join.
+  lastErrorCode    String? @map("last_error_code")
+  lastErrorMessage String? @map("last_error_message")
+  result           Json?
+
+  /// Correlation id of the API request that created this job. Ties one grep
+  /// across the API, the worker and every retry (§20.2).
+  requestId   String?  @map("request_id")
+  createdById String?  @map("created_by") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  queue        Queue         @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  scheduledJob ScheduledJob? @relation("ScheduleRuns", fields: [scheduledJobId], references: [id], onDelete: SetNull)
+  parentJob    Job?          @relation("JobReplayChain", fields: [parentJobId], references: [id], onDelete: SetNull)
+  childJobs    Job[]         @relation("JobReplayChain")
+  worker       Worker?       @relation(fields: [workerId], references: [id], onDelete: SetNull)
+  retryPolicy  RetryPolicy?  @relation(fields: [retryPolicyId], references: [id], onDelete: SetNull)
+  createdBy    User?         @relation("JobCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  executions    JobExecution[]
+  logs          JobLog[]
+  deadLetterJob DeadLetterJob?  @relation("DlqJob")
+  replayedFrom  DeadLetterJob[] @relation("DlqReplayJob")
+  lastRunOf     ScheduledJob[]  @relation("ScheduleLastJob")
+
+  // The job explorer's main list.
+  @@index([projectId, status, createdAt(sort: Desc)], map: "idx_jobs_explorer")
+  @@index([queueId, createdAt(sort: Desc)], map: "idx_jobs_queue_created")
+  @@index([batchId], map: "idx_jobs_batch")
+  @@index([parentJobId], map: "idx_jobs_parent")
+  //
+  // The four indexes that actually decide whether this system works are PARTIAL
+  // and cannot be expressed here. They are created by hand in the migration:
+  //
+  //   idx_jobs_claim      (queue_id, priority DESC, run_at, id) WHERE status='QUEUED'
+  //   idx_jobs_promote    (run_at)           WHERE status IN ('SCHEDULED','RETRYING')
+  //   idx_jobs_lease      (lease_expires_at) WHERE status IN ('CLAIMED','RUNNING')
+  //   uq_jobs_idem        UNIQUE (queue_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+  //   uq_jobs_sched_slot  UNIQUE (scheduled_job_id, scheduled_for) WHERE scheduled_job_id IS NOT NULL
+  //
+  @@map("jobs")
+}
+
+/// One row per ATTEMPT. This split from `jobs` is what makes retry history,
+/// per-attempt timings, per-attempt worker assignment and per-attempt errors
+/// queryable instead of squashed into a JSON blob.
+/// bigserial, not uuid: high volume, and 8 bytes beats 16 across several indexes.
+model JobExecution {
+  id       BigInt          @id @default(autoincrement())
+  jobId    String          @map("job_id") @db.Uuid
+  attempt  Int
+  workerId String?         @map("worker_id") @db.Uuid
+  status   ExecutionStatus
+
+  startedAt  DateTime  @default(now()) @map("started_at") @db.Timestamptz(3)
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz(3)
+  /// Stored, not derived, so the metrics rollup never recomputes it.
+  durationMs Int?      @map("duration_ms")
+
+  errorCode    String? @map("error_code")
+  /// Truncated to 4 KB before storage — a handler that throws an error
+  /// containing the whole request body would otherwise leak the payload here.
+  errorMessage String? @map("error_message")
+  /// Truncated to 16 KB.
+  errorStack   String? @map("error_stack")
+  result       Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  job    Job     @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  worker Worker? @relation(fields: [workerId], references: [id], onDelete: SetNull)
+  logs   JobLog[]
+
+  /// A second, independent barrier behind atomic claiming: a duplicated attempt
+  /// row is impossible even if the claim logic were wrong.
+  @@unique([jobId, attempt], map: "uq_executions_job_attempt")
+  @@index([workerId, startedAt(sort: Desc)], map: "idx_executions_worker")
+  @@index([status, finishedAt(sort: Desc)], map: "idx_executions_rollup")
+  @@map("job_executions")
+}
+
+/// The highest-volume table in the system. Written by the worker's buffered log
+/// flusher OUTSIDE the job's transactions, so a chatty handler never lengthens
+/// a hot transaction. Purged by the retention loop.
+model JobLog {
+  id          BigInt   @id @default(autoincrement())
+  executionId BigInt   @map("execution_id")
+  /// Denormalised: fetch every log line for a job across all attempts without a join.
+  jobId       String   @map("job_id") @db.Uuid
+  level       LogLevel
+  message     String
+  context     Json?
+  /// Handler-side timestamp, not insert time — the buffer flushes up to 1s late.
+  loggedAt    DateTime @map("logged_at") @db.Timestamptz(3)
+
+  execution JobExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  job       Job          @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([executionId, loggedAt], map: "idx_logs_execution")
+  @@index([jobId, loggedAt], map: "idx_logs_job")
+  @@map("job_logs")
+}
+
+// ── Workers ──────────────────────────────────────────────────────────────────
+
+model Worker {
+  id       String       @id @default(uuid()) @db.Uuid
+  orgId    String       @map("org_id") @db.Uuid
+  name     String
+  hostname String
+  pid      Int
+  version  String
+  status   WorkerStatus @default(STARTING)
+  /// This process's local slot count — a resource limit, not the per-queue cap.
+  concurrency    Int
+  activeJobCount Int @default(0) @map("active_job_count")
+
+  startedAt DateTime  @default(now()) @map("started_at") @db.Timestamptz(3)
+  /// Updated IN PLACE every 5s. Liveness must read one row, never aggregate a
+  /// history table — which is why worker_heartbeats is separate (§14.2).
+  lastHeartbeatAt DateTime @default(now()) @map("last_heartbeat_at") @db.Timestamptz(3)
+  stoppedAt       DateTime? @map("stopped_at") @db.Timestamptz(3)
+  metadata        Json?
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  subscriptions WorkerSubscription[]
+  heartbeats    WorkerHeartbeat[]
+  jobs          Job[]
+  executions    JobExecution[]
+
+  @@index([status, lastHeartbeatAt], map: "idx_workers_liveness")
+  @@index([orgId])
+  @@map("workers")
+}
+
+/// Which queues a worker serves. A join table rather than a uuid[] column, so
+/// "which workers serve this queue" is a plain join and referential integrity
+/// survives queue deletion.
+model WorkerSubscription {
+  workerId  String   @map("worker_id") @db.Uuid
+  queueId   String   @map("queue_id") @db.Uuid
+  /// Weighted round-robin across a worker's queues. Higher is claimed first.
+  weight    Int      @default(100) @db.SmallInt
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  queue  Queue  @relation(fields: [queueId], references: [id], onDelete: Cascade)
+
+  @@id([workerId, queueId])
+  @@index([queueId])
+  @@map("worker_subscriptions")
+}
+
+/// Sampled history for the worker charts, every 15s — NOT the 5s liveness ping.
+/// Appending every ping would be ~172k rows/day for 10 workers, at a resolution
+/// nobody reads. Pruned after 24h.
+model WorkerHeartbeat {
+  id       BigInt @id @default(autoincrement())
+  workerId String @map("worker_id") @db.Uuid
+
+  recordedAt     DateTime @default(now()) @map("recorded_at") @db.Timestamptz(3)
+  activeJobCount Int      @map("active_job_count")
+  /// Since the previous sample, so throughput is a SUM rather than a
+  /// difference-of-counters.
+  jobsProcessedDelta Int   @default(0) @map("jobs_processed_delta")
+  cpuPct             Float? @map("cpu_pct")
+  memMb              Int?   @map("mem_mb")
+
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([workerId, recordedAt(sort: Desc)], map: "idx_heartbeats_worker")
+  @@map("worker_heartbeats")
+}
+
+// ── Recurring schedules ──────────────────────────────────────────────────────
+
+/// A template plus a cursor. It never executes anything — the scheduler
+/// materialises concrete `jobs` rows from it. Duplicate firing is prevented by
+/// TWO independent guards: an optimistic CAS on nextRunAt, and a unique index on
+/// jobs(scheduled_job_id, scheduled_for). See ARCHITECTURE.md §10.3.
+model ScheduledJob {
+  id        String @id @default(uuid()) @db.Uuid
+  projectId String @map("project_id") @db.Uuid
+  queueId   String @map("queue_id") @db.Uuid
+  name      String
+
+  cronExpression String @map("cron_expression")
+  /// IANA name (`Asia/Kolkata`), never a fixed offset — offsets are wrong twice a year.
+  timezone       String @default("UTC")
+
+  // ── The job template, copied onto each materialised job ──
+  handler       String
+  payload       Json    @default("{}")
+  priority      Int     @default(100) @db.SmallInt
+  maxAttempts   Int?    @map("max_attempts")
+  timeoutMs     Int?    @map("timeout_ms")
+  retryPolicyId String? @map("retry_policy_id") @db.Uuid
+
+  isEnabled     Boolean       @default(true) @map("is_enabled")
+  misfirePolicy MisfirePolicy @default(SKIP) @map("misfire_policy")
+  catchupLimit  Int           @default(10) @map("catchup_limit")
+
+  startAt DateTime? @map("start_at") @db.Timestamptz(3)
+  endAt   DateTime? @map("end_at") @db.Timestamptz(3)
+
+  /// The scheduler's cursor. Advanced by an optimistic CAS in the same
+  /// transaction that inserts the job.
+  nextRunAt DateTime  @map("next_run_at") @db.Timestamptz(3)
+  lastRunAt DateTime? @map("last_run_at") @db.Timestamptz(3)
+  lastJobId String?   @map("last_job_id") @db.Uuid
+
+  createdById String?  @map("created_by") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  queue       Queue        @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  retryPolicy RetryPolicy? @relation(fields: [retryPolicyId], references: [id], onDelete: SetNull)
+  lastJob     Job?         @relation("ScheduleLastJob", fields: [lastJobId], references: [id], onDelete: SetNull)
+  createdBy   User?        @relation("ScheduleCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  runs Job[] @relation("ScheduleRuns")
+
+  @@unique([projectId, name])
+  // The scheduler's every-second scan. Made partial (WHERE is_enabled) in the migration.
+  @@index([nextRunAt], map: "idx_scheduled_due")
+  @@map("scheduled_jobs")
+}
+
+// ── Dead letter queue ────────────────────────────────────────────────────────
+
+/// An index over permanent failures plus resolution metadata — NOT a second home
+/// for the job. The original `jobs` row is kept, so job_id FKs stay valid and the
+/// job detail page works identically for a dead-lettered job.
+model DeadLetterJob {
+  id        String @id @default(uuid()) @db.Uuid
+  jobId     String @unique @map("job_id") @db.Uuid
+  /// Denormalised so the DLQ inbox filters without joining `jobs`.
+  queueId   String @map("queue_id") @db.Uuid
+  projectId String @map("project_id") @db.Uuid
+
+  reason       DlqReason
+  errorCode    String? @map("error_code")
+  errorMessage String? @map("error_message")
+  totalAttempts Int    @map("total_attempts")
+  /// A COPY, so a replay is still possible after retention purges the original
+  /// payload. A DLQ entry that cannot be replayed is worthless.
+  payloadSnapshot Json @map("payload_snapshot")
+
+  firstFailedAt   DateTime @map("first_failed_at") @db.Timestamptz(3)
+  deadLetteredAt  DateTime @default(now()) @map("dead_lettered_at") @db.Timestamptz(3)
+
+  /// Stable grouping key: error_code + normalised message. The inbox groups by
+  /// this because 400 failures are usually 3 problems.
+  errorSignature String? @map("error_signature")
+  /// Populated by the AI-summary bonus, cached per signature.
+  aiSummary      String? @map("ai_summary")
+
+  resolvedAt   DateTime?      @map("resolved_at") @db.Timestamptz(3)
+  resolvedById String?        @map("resolved_by") @db.Uuid
+  resolution   DlqResolution?
+  resolutionNote String?      @map("resolution_note")
+  replayJobId  String?        @map("replay_job_id") @db.Uuid
+
+  job        Job     @relation("DlqJob", fields: [jobId], references: [id], onDelete: Cascade)
+  queue      Queue   @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  project    Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  replayJob  Job?    @relation("DlqReplayJob", fields: [replayJobId], references: [id], onDelete: SetNull)
+  resolvedBy User?   @relation("DlqResolvedBy", fields: [resolvedById], references: [id], onDelete: SetNull)
+
+  @@index([projectId, deadLetteredAt(sort: Desc)], map: "idx_dlq_inbox")
+  @@index([errorSignature], map: "idx_dlq_signature")
+  @@map("dead_letter_jobs")
+}
+
+// ── Metrics ──────────────────────────────────────────────────────────────────
+
+/// Pre-aggregated per-minute rollups. The throughput chart asks "jobs/minute
+/// over 24h"; answering that from job_executions would aggregate millions of
+/// rows on every dashboard load. Written by the scheduler's aggregator once a
+/// minute — NOT by the completion transaction, which would recreate the hot-row
+/// contention we avoided on `queues`. Cost: metrics lag up to 60s. (§4.2)
+model QueueMetricMinute {
+  id      BigInt   @id @default(autoincrement())
+  queueId String   @map("queue_id") @db.Uuid
+  bucket  DateTime @db.Timestamptz(3)
+
+  completedCount Int @default(0) @map("completed_count")
+  failedCount    Int @default(0) @map("failed_count")
+  dlqCount       Int @default(0) @map("dlq_count")
+
+  /// Kept so averages stay mergeable when minute buckets roll into hours.
+  totalDurationMs BigInt @default(0) @map("total_duration_ms")
+  avgDurationMs   Int    @default(0) @map("avg_duration_ms")
+  p95DurationMs   Int    @default(0) @map("p95_duration_ms")
+  maxDurationMs   Int    @default(0) @map("max_duration_ms")
+
+  queue Queue @relation(fields: [queueId], references: [id], onDelete: Cascade)
+
+  @@unique([queueId, bucket], map: "uq_metrics_queue_bucket")
+  @@index([bucket(sort: Desc)], map: "idx_metrics_bucket")
+  @@map("queue_metrics_minute")
+}

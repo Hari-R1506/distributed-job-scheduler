@@ -1,0 +1,28 @@
+flowchart LR
+    subgraph core["packages/core — shared domain"]
+        SM[job-state-machine]
+        BO[backoff calculator]
+        EC[error classifier]
+        DT[DTO / types]
+        CR[cron utilities]
+    end
+    subgraph db["packages/db"]
+        PS[Prisma schema<br/>+ migrations]
+        RQ[raw SQL:<br/>claim · promote · reap]
+    end
+    subgraph api["apps/api"]
+        AC[controllers] --> AS[services] --> AR[repositories]
+    end
+    subgraph wk["apps/worker"]
+        CL[claim loop] --> EX[executor pool] --> HR[handler registry]
+        HB[heartbeat] --- LF[log flusher] --- LS[NOTIFY listener]
+    end
+    subgraph sc["apps/scheduler"]
+        LE[leader election] --> PR[promoter] --- CM[cron materialiser] --- RP[reaper] --- AG[aggregator]
+    end
+    core --> api
+    core --> wk
+    core --> sc
+    db --> api
+    db --> wk
+    db --> sc
